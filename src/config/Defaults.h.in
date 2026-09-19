@@ -1,0 +1,2 @@
+#pragma once
+inline constexpr wchar_t kDefaultNewfonIni[] = LR"ini(@DEFAULT_INI@)ini";
