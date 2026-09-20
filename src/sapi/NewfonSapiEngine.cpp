@@ -1166,9 +1166,18 @@ static void ApplyPitchRawToConf(long rawPitchAdj, newfon_conf_t& conf) {
     conf.pitch = ClampInt(conf.pitch + MapPitchAdjToVoicePitch(rawPitchAdj) - 50, 0, 100);
 }
 
+// Скорость ядра -- это множитель длительности: 0 самая быстрая речь, 150 самая
+// медленная. Ползунок хоста растягивается на весь этот диапазон ровно так же,
+// как в драйвере NVDA, поэтому одинаковые числа дают одинаковую речь.
+// Отсчитывать же от умолчания ядра (30) нельзя: оно само почти у быстрого края,
+// верхняя половина ползунка упиралась в ноль, а там длительности всех звуков
+// падают до нижнего порога -- речь звучит обрубленной.
 static void ApplyRateAdjToConf(long adj, newfon_conf_t& conf) {
-    // Newfon rate is a duration factor: lower values mean faster speech.
-    conf.speech_rate = MapNormalizedAdjToRange(-adj, conf.speech_rate, 0, 150);
+    const int percent = (ClampInt(static_cast<int>(adj), -10, 10) + 10) * 5;
+    conf.speech_rate = ClampInt(
+        NEWFON_RATE_MAX - (percent * NEWFON_RATE_MAX + 50) / 100,
+        NEWFON_RATE_MIN,
+        NEWFON_RATE_MAX);
 }
 
 HRESULT NewfonEngine::Speak(DWORD /*dwSpeakFlags*/, REFGUID formatId, const WAVEFORMATEX* format,
@@ -1318,12 +1327,9 @@ HRESULT NewfonEngine::Speak(DWORD /*dwSpeakFlags*/, REFGUID formatId, const WAVE
 
     ctx.gainPercent = ClampInt(static_cast<int>(vol), 0, 100);
 
-    // Базовая скорость запоминается ДО первого применения: SPVES_RATE посреди
-    // фразы пересчитывает её ОТ НЕЁ ЖЕ, а не поверх уже сдвинутой -- иначе каждая
-    // перестройка складывалась бы с предыдущей.
-    const int baseSpeechRate = conf.speech_rate;
+    // Скорость считается от запроса хоста, а не от текущего значения: SPVES_RATE
+    // посреди фразы задаёт её заново, и складываться перестройки не должны.
     auto applyRate = [&](long normalizedAdj) {
-        conf.speech_rate = baseSpeechRate;
         ApplyRateAdjToConf(normalizedAdj, conf);
     };
     applyRate(rateAdj);

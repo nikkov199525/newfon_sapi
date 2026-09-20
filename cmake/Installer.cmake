@@ -3,6 +3,9 @@
 find_program(ISCC_EXECUTABLE NAMES ISCC.exe iscc.exe HINTS
  "C:/Program Files (x86)/Inno Setup 6" "C:/Program Files/Inno Setup 6" "$ENV{LOCALAPPDATA}/Programs/Inno Setup 6")
 set(NEWFON_X86_BIN_DIR "${CMAKE_SOURCE_DIR}/build/x86/bin" CACHE PATH "bin directory of the x86 build tree")
+if(NEWFON_REQUIRE_RELEASE_TOOLS AND NOT ISCC_EXECUTABLE)
+ message(FATAL_ERROR "Inno Setup 6 not found. Set ISCC_EXECUTABLE to ISCC.exe.")
+endif()
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND ISCC_EXECUTABLE AND NEWFON_BUILD_CONFIGURATOR)
  # The installer is versioned by the day it is built, as the 2019 one was.
  string(TIMESTAMP SETUP_VERSION "%Y.%m.%d")

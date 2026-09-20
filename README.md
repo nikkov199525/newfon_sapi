@@ -52,10 +52,25 @@ git submodule update --init --recursive
 build_release.cmd
 ```
 
+Имя команды, порядок сборки и каталог установщика сохранены. Батник вызывает
+единый сценарий CMake; его можно запустить напрямую из любого каталога,
+указав путь к сценарию:
+
+```bash
+cmake -P cmake/Release.cmake
+```
+
+Сценарий выбирает Release, включает конфигуратор и тесты даже для существующих
+деревьев сборки и останавливается при первой ошибке. Проверка конфигуратора
+входит в CTest и находит Python через CMake — команда `python` в `PATH`
+больше не обязательна.
+
 Отдельная разрядность собирается обычным образом:
 
 ```bash
 cmake -S . -B build/x64 -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-x64.cmake
+cmake --build build/x64 --parallel
+ctest --test-dir build/x64 --output-on-failure
 ```
 
 Цель `installer` собирает пакет из обоих деревьев сборки, поэтому дерево `x86`

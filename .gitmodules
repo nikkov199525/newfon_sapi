@@ -13,3 +13,4 @@
 [submodule "external/libsamplerate"]
 	path = external/libsamplerate
 	url = https://github.com/nikkov199525/libsamplerate
+	branch = sapi
