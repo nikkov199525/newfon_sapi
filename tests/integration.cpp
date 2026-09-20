@@ -15,7 +15,7 @@
 #include <cstdint>
 #define CHECK(x) do { if(!(x)) throw std::runtime_error(#x); } while(0)
 struct Site final : ISpTTSEngineSite {
-    // The engine speaks 8-bit mono by default, so audio is kept as raw bytes.
+    // Audio is kept as raw bytes: the tests ask for both 8- and 16-bit formats.
     std::vector<uint8_t> audio;
     long rate=0;
     USHORT volume=100;
@@ -65,7 +65,7 @@ int main(int argc,char** argv) {
         CHECK(ApplyUserDictionary(L"Слово словом") == L"сло+во словом");
         Write(config/"ru_dict.dic", "");CHECK(ApplyUserDictionary(L"слово")==L"слово");
         Write(config/"prefs.ini", "[General]\nsample_rate=bad\ninterpolation_multiplier=99\nUseLegacyRateAlgo=garbage\naccel=8\n");
-        p=ParamReader::Load();CHECK(p.samples_per_sec==10000 && p.use_legacy_rate_algo && p.acceleration==0);
+        p=ParamReader::Load();CHECK(p.samples_per_sec==11025 && p.use_legacy_rate_algo && p.acceleration==0);
         // Each voice token activates a distinct core voice; no COM server registration needed.
         HMODULE dll=LoadLibraryW((bin/L"newfon_sapi.dll").c_str());CHECK(dll);
         auto getClass=reinterpret_cast<HRESULT (WINAPI*)(REFCLSID,REFIID,void**)>(GetProcAddress(dll,"DllGetClassObject"));CHECK(getClass);
@@ -80,9 +80,10 @@ int main(int argc,char** argv) {
             CHECK(SUCCEEDED(withToken->SetObjectToken(token)));
             token->SetDWORD(L"VoiceIndex",99);CHECK(withToken->SetObjectToken(token)==E_INVALIDARG);
             GUID fmt;WAVEFORMATEX* wave=nullptr;CHECK(SUCCEEDED(engine->GetOutputFormat(nullptr,nullptr,&fmt,&wave)));
-            // SAPI is handed the format of the original Newfon SAPI: 11025 Hz, 8-bit
-            // mono, as the JAWS instructions expect (sapi5x.ini, Output=8).
-            CHECK(wave->nSamplesPerSec==11025 && wave->wBitsPerSample==8 && wave->nChannels==1 && wave->nBlockAlign==1);
+            // SAPI is handed the rate of the original Newfon SAPI, 16-bit mono:
+            // volume is applied before the samples leave, and 8 bits would not
+            // survive it quietly.
+            CHECK(wave->nSamplesPerSec==11025 && wave->wBitsPerSample==16 && wave->nChannels==1 && wave->nBlockAlign==2);
             std::wstring text=L"Проверка голоса. Привет, мир!";
             SPVTEXTFRAG frag{};frag.State.eAction=SPVA_Speak;frag.State.Volume=100;frag.pTextStart=text.c_str();frag.ulTextLen=static_cast<ULONG>(text.size());
             Site normal;CHECK(SUCCEEDED(engine->Speak(0,fmt,wave,&frag,&normal)));CHECK(normal.audio.size()>1000);hashes.insert(Hash(normal.audio));
@@ -90,8 +91,7 @@ int main(int argc,char** argv) {
             Site slow;slow.rate=-8;CHECK(SUCCEEDED(engine->Speak(0,fmt,wave,&frag,&slow)));CHECK(slow.audio.size()>normal.audio.size());
             Site stopped;stopped.abort=true;CHECK(SUCCEEDED(engine->Speak(0,fmt,wave,&frag,&stopped)));CHECK(stopped.audio.empty());
             Site midstop;midstop.abortAfter=100;CHECK(SUCCEEDED(engine->Speak(0,fmt,wave,&frag,&midstop)));CHECK(midstop.audio.size()<normal.audio.size());
-            // Silence in unsigned 8-bit PCM is 128, not 0.
-            Site muted;muted.volume=0;CHECK(SUCCEEDED(engine->Speak(0,fmt,wave,&frag,&muted)));for(uint8_t sample:muted.audio) CHECK(sample==128);
+            Site muted;muted.volume=0;CHECK(SUCCEEDED(engine->Speak(0,fmt,wave,&frag,&muted)));for(uint8_t byte:muted.audio) CHECK(byte==0);
             std::cout<<"voice "<<voice<<": "<<normal.audio.size()<<" bytes, rate and abort OK\n";
             CoTaskMemFree(wave);token->Release();withToken->Release();engine->Release();
         }
@@ -122,6 +122,32 @@ int main(int argc,char** argv) {
             std::cout<<"Latin combinations replaced as a group\n";
         }
         {
+            // Without interpolation SAPI gets the core audio untouched: the same
+            // rate, so nothing is resampled, and 8 bits hold it exactly. Resampling
+            // or requantizing here would add noise about 38 dB below the signal.
+            Write(config/"prefs.ini","[General]\nuse_dictionary=0\nsample_rate=11025\n");
+            ISpTTSEngine* engine=nullptr;CHECK(SUCCEEDED(factory->CreateInstance(nullptr,__uuidof(ISpTTSEngine),reinterpret_cast<void**>(&engine))));
+            ISpObjectWithToken* withToken=nullptr;CHECK(SUCCEEDED(engine->QueryInterface(__uuidof(ISpObjectWithToken),reinterpret_cast<void**>(&withToken))));
+            ISpObjectToken* token=nullptr;CHECK(SUCCEEDED(CoCreateInstance(__uuidof(SpObjectToken),nullptr,CLSCTX_INPROC_SERVER,__uuidof(ISpObjectToken),reinterpret_cast<void**>(&token))));
+            CHECK(SUCCEEDED(token->SetId(nullptr,(L"HKEY_CURRENT_USER\\"+registry).c_str(),TRUE)));
+            CHECK(SUCCEEDED(token->SetDWORD(L"VoiceIndex",0)));CHECK(SUCCEEDED(withToken->SetObjectToken(token)));
+            std::wstring text=L"Проверка голоса, сегодня хорошая погода.";
+            SPVTEXTFRAG frag{};frag.State.eAction=SPVA_Speak;frag.State.Volume=100;frag.pTextStart=text.c_str();frag.ulTextLen=(ULONG)text.size();
+            auto speakAs=[&](int bits) {
+                WAVEFORMATEX w{};w.wFormatTag=WAVE_FORMAT_PCM;w.nChannels=1;w.nSamplesPerSec=11025;
+                w.wBitsPerSample=(WORD)bits;w.nBlockAlign=(WORD)(bits/8);w.nAvgBytesPerSec=11025*w.nBlockAlign;
+                Site site;CHECK(SUCCEEDED(engine->Speak(0,SPDFID_WaveFormatEx,&w,&frag,&site)));return site.audio;
+            };
+            auto eight=speakAs(8),sixteen=speakAs(16);
+            CHECK(!eight.empty() && sixteen.size()==eight.size()*2);
+            for(size_t i=0;i<eight.size();++i) {
+                const int16_t sample=(int16_t)(sixteen[2*i]|(sixteen[2*i+1]<<8));
+                CHECK((int)eight[i]-128==(sample>>8) && (sample&0xFF)==0);
+            }
+            std::cout<<"Core audio reaches SAPI unchanged: "<<eight.size()<<" bytes\n";
+            token->Release();withToken->Release();engine->Release();
+        }
+        {
             // Bookmarks (NVDA sets one per chunk) meet resampling (10000 Hz core ->
             // 11025 Hz output): flushing the resampler must not drop the audio held
             // back for the events.
@@ -143,7 +169,7 @@ int main(int argc,char** argv) {
                 CHECK(SUCCEEDED(token->SetId(nullptr,(L"HKEY_CURRENT_USER\\"+registry).c_str(),TRUE)));
                 CHECK(SUCCEEDED(token->SetDWORD(L"VoiceIndex",0)));CHECK(SUCCEEDED(withToken->SetObjectToken(token)));
                 GUID fmt;WAVEFORMATEX* wave=nullptr;CHECK(SUCCEEDED(engine->GetOutputFormat(nullptr,nullptr,&fmt,&wave)));
-                CHECK(wave->nSamplesPerSec==(marked<2?11025u:22050u) && wave->wBitsPerSample==8);
+                CHECK(wave->nSamplesPerSec==(marked<2?11025u:22050u) && wave->wBitsPerSample==16);
                 Site site;CHECK(SUCCEEDED(engine->Speak(0,fmt,wave,marked?&a:&plain,&site)));
                 CHECK(site.bookmarks==(marked?1:0));
                 if(marked<2) lengths[marked]=site.audio.size(); else marked2x=site.audio.size();

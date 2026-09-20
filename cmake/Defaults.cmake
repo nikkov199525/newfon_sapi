@@ -14,7 +14,11 @@ foreach(LINE IN LISTS SPEC_LINES)
   set(VALUE "${CMAKE_MATCH_2}")
   if(SECTION STREQUAL "Parameters")
    if(KEY STREQUAL "samples_per_sec")
+    # SAPI gets the core audio unchanged, so this rate is also the output rate.
+    # The bridge ships with the top of the slider: the rate of the original
+    # Newfon SAPI, which its JAWS instructions name.
     set(KEY "sample_rate")
+    set(VALUE "11025")
    endif()
    string(APPEND DEFAULT_INI "${KEY} = ${VALUE}\n")
   elseif(SECTION STREQUAL "Characters")

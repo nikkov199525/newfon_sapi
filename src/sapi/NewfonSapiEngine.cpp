@@ -33,9 +33,10 @@ enum class CallbackInputFormat {
 struct EngineContext {
     ISpTTSEngineSite* site = nullptr;
 
-    int inRate = 10000;
-    int outRate = kSapiBaseOutputRate;
-    // SAPI всегда получает формат ядра: 8 бит моно. Хост вправе попросить 16.
+    int inRate = kSapiDefaultRate;
+    // Обычно совпадает с inRate: звук ядра уходит без пересчёта. Расходятся
+    // они при интерполяции и когда хост просит свой формат.
+    int outRate = kSapiDefaultRate;
     int outBits = kSapiOutputBits;
     int gainPercent = 100;
     int interpolationAlgorithm = SRC_LINEAR;
@@ -670,8 +671,11 @@ static int WritePcmSamples(EngineContext* ctx, const int16_t* samples, size_t co
 
     ctx->wave8.resize(count);
     for (size_t i = 0; i < count; ++i) {
-        // 8-битный PCM в WAVE -- беззнаковый, с нулём в 128.
-        ctx->wave8[i] = static_cast<uint8_t>((samples[i] >> 8) + 128);
+        // 8-битный PCM в WAVE -- беззнаковый, с нулём в 128. Округление, а не
+        // отбрасывание младшего байта: у пересчитанного звука тот половину
+        // значений уводил бы вниз. Ровные 8-битные отсчёты ядра не страдают.
+        const int rounded = (static_cast<int>(samples[i]) + 128) >> 8;
+        ctx->wave8[i] = static_cast<uint8_t>(ClampInt(rounded, -128, 127) + 128);
     }
     return WriteAllToSite(ctx, ctx->wave8.data(), count);
 }

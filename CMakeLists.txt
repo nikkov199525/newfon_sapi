@@ -121,7 +121,8 @@ install(DIRECTORY LICENSES docs DESTINATION .)
 # --- Tests ------------------------------------------------------------------
 include(CTest)
 if(BUILD_TESTING)
- add_executable(newfon_integration tests/integration.cpp src/sapi/RulexClient.cpp src/sapi/WinUtil.cpp)
+ # NewfonSapiGuids.cpp: the test asks the engine for a format of its own.
+ add_executable(newfon_integration tests/integration.cpp src/sapi/RulexClient.cpp src/sapi/WinUtil.cpp src/sapi/NewfonSapiGuids.cpp)
  target_include_directories(newfon_integration PRIVATE src/sapi src/rulex)
  target_link_libraries(newfon_integration PRIVATE newfon_config ole32 uuid advapi32)
  add_dependencies(newfon_integration newfon_sapi newfon_core newfon_rulex rulex rulex_database)

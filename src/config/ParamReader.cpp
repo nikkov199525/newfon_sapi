@@ -36,7 +36,7 @@ NewfonParams ParamReader::Load() {
     EnsureFile(IniPath(),kDefaultNewfonIni);
     IniFile ini(IniPath()),prefs(PrefsPath());
     NewfonParams p;
-    p.samples_per_sec=ini.Integer(L"General",L"sample_rate",10000,8000,16000);
+    p.samples_per_sec=ini.Integer(L"General",L"sample_rate",kSapiDefaultRate,8000,16000);
     int mul=ini.Integer(L"General",L"interpolation_multiplier",1,1,4);
     p.interpolation_multiplier=mul==3?4:mul;
     p.interpolation_algorithm=ini.Integer(L"General",L"interpolation_algorithm",0,0,1)==0?InterpolationAlgorithm::Linear:InterpolationAlgorithm::ZeroOrderHold;
