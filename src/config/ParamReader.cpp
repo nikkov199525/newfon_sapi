@@ -32,6 +32,7 @@ void EnsureFile(const std::wstring& path,const wchar_t* contents) {
 std::wstring ParamReader::IniPath(){return (ConfigDir()/L"prefs.ini").wstring();}
 std::wstring ParamReader::PrefsPath(){return (ConfigDir()/L"prefs.ini").wstring();}
 std::wstring ParamReader::DictionaryPath(){return (ConfigDir()/L"ru_dict.dic").wstring();}
+std::wstring ParamReader::TracePath(){return (ConfigDir()/L"sapi_trace.log").wstring();}
 NewfonParams ParamReader::Load() {
     EnsureFile(IniPath(),kDefaultNewfonIni);
     IniFile ini(IniPath()),prefs(PrefsPath());

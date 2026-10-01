@@ -38,5 +38,7 @@ public:
     static std::wstring IniPath();
     static std::wstring PrefsPath();
     static std::wstring DictionaryPath();
+    // Diagnostic log of what the host sends; written only while the file exists.
+    static std::wstring TracePath();
 };
 

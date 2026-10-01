@@ -38,7 +38,11 @@ struct EngineContext {
     // они при интерполяции и когда хост просит свой формат.
     int outRate = kSapiDefaultRate;
     int outBits = kSapiOutputBits;
+    // Итоговое усиление -- громкость клиента (SetVolume) на громкость фрагмента
+    // (<volume level>): SAPI велит их перемножать.
     int gainPercent = 100;
+    int baseVolume = 100;
+    int segmentVolume = 100;
     int interpolationAlgorithm = SRC_LINEAR;
     CallbackInputFormat inputFormat = CallbackInputFormat::Raw8BitBytes;
 
@@ -48,6 +52,11 @@ struct EngineContext {
     std::vector<float> outFloat;
     std::vector<int16_t> silence16;
     std::vector<uint8_t> wave8;
+
+    // Последние сэмплы звука, придержанные до того, как станет ясно, хвост ли это
+    // (см. WritePcmSamples и FinishSound). tailLen -- длина затухания в сэмплах.
+    std::vector<int16_t> tail;
+    size_t tailLen = 0;
 
     // Клиент снял фразу (ABORT/SKIP/SP_AUDIO_STOPPED). Раз поднятый флаг гасит
     // всю дальнейшую запись в site до конца этого вызова Speak.
@@ -65,11 +74,10 @@ struct EngineContext {
     std::vector<uint8_t> capture;
     bool capturing = false;
 
-    // Клиент попросил сменить скорость посреди фразы (SPVES_RATE). Значение
-    // применяется на границе сегмента: перестраивать conf внутри transfer
-    // нельзя.
-    bool rateDirty = false;
-    long pendingRateAdj = 0;
+    // Скорость клиента (SetRate). К ней прибавляется скорость фрагмента
+    // (<rate>), а conf перестраивается на границе сегмента: внутри transfer его
+    // трогать нельзя. Поэтому SPVES_RATE посреди фразы здесь просто запоминается.
+    long baseRateAdj = 0;
 };
 
 // SP_AUDIO_STOPPED -- это КОД УСПЕХА (0x00045065), а не ошибка: FAILED() его не
@@ -82,11 +90,15 @@ struct EngineContext {
 
 static int ClampInt(int v, int lo, int hi);
 
+static void UpdateGain(EngineContext* ctx) {
+    ctx->gainPercent = ClampInt(ctx->baseVolume * ctx->segmentVolume / 100, 0, 100);
+}
+
 // Снимает запросы клиента, приходящие ПОСРЕДИ фразы. Возвращает false, когда
 // синтез надо прекратить (отмена/пропуск). Громкость применяется на лету --
-// усиление берётся в колбэке для следующих кусков. Скорость ru_tts внутри
-// одного transfer сменить нельзя, поэтому бит SPVES_RATE просто снимается
-// чтением GetRate, чтобы SAPI не поднимала его снова и снова.
+// усиление берётся в колбэке для следующих кусков. Скорость ядра внутри
+// одного transfer сменить нельзя: новое значение запоминается до следующего
+// сегмента, а чтение GetRate снимает бит, чтобы SAPI не поднимала его снова.
 static bool CheckSapiActions(EngineContext* ctx) {
     if (!ctx || !ctx->site || ctx->sapiStop) return false;
 
@@ -108,15 +120,15 @@ static bool CheckSapiActions(EngineContext* ctx) {
     if (actions & SPVES_VOLUME) {
         USHORT volume = 100;
         if (SUCCEEDED(ctx->site->GetVolume(&volume))) {
-            ctx->gainPercent = ClampInt(static_cast<int>(volume), 0, 100);
+            ctx->baseVolume = ClampInt(static_cast<int>(volume), 0, 100);
+            UpdateGain(ctx);
         }
     }
 
     if (actions & SPVES_RATE) {
         long rateAdj = 0;
         if (SUCCEEDED(ctx->site->GetRate(&rateAdj))) {
-            ctx->pendingRateAdj = rateAdj;
-            ctx->rateDirty = true;
+            ctx->baseRateAdj = rateAdj;
         }
     }
 
@@ -134,16 +146,13 @@ static void ToLowerInplace(std::wstring& s) {
     CharLowerBuffW(s.data(), (DWORD)s.size());
 }
 
-static std::wstring StripAngleTags(const std::wstring& in) {
-    std::wstring out;
-    out.reserve(in.size());
-    bool inTag = false;
-    for (wchar_t ch : in) {
-        if (ch == L'<') { inTag = true; continue; }
-        if (ch == L'>') { inTag = false; continue; }
-        if (!inTag) out.push_back(ch);
-    }
-    return out;
+// Разметку разбирает сама SAPI, и до движка теги не доходят: '<' и '>' в тексте
+// фрагмента -- это настоящие знаки ("a < b", код, &lt; из XML). Раньше они
+// считались тегом, и всё от '<' до '>' или до конца фразы молча пропадало.
+// Читать их ядро не умеет, поэтому они просто становятся пробелами.
+static std::wstring BlankAngleBrackets(std::wstring s) {
+    for (auto& ch : s) if (ch == L'<' || ch == L'>') ch = L' ';
+    return s;
 }
 
 static bool IsIgnorableFormatChar(wchar_t ch) {
@@ -200,7 +209,7 @@ static void CollapseSpacesInplace(std::wstring& s) {
 }
 
 static std::wstring SanitizeText(std::wstring s) {
-    s = StripAngleTags(s);
+    s = BlankAngleBrackets(std::move(s));
     s = RemoveControlChars(s);
 
 
@@ -620,6 +629,13 @@ static bool QueueBookmarkEvent(EngineContext* ctx, const std::wstring& name, std
     return SUCCEEDED(ctx->site->AddEvents(&event, 1));
 }
 
+// Ядро обрывает звук посреди волны: последний сэмпл фразы бывает и -3000, и
+// -7000 (10-20% шкалы), а следом сразу тишина. Такая ступенька слышна щелчком
+// на конце каждой реплики. В JAWS реплик особенно много -- отдельная фраза на
+// каждую клавишу и каждый фокус, -- отсюда "артефакты на концах". Последние
+// миллисекунды звука ядра поэтому плавно гасятся до нуля.
+constexpr int kFadeOutMs = 5;
+
 static void FreeAudioPipeline(EngineContext* ctx) {
     if (!ctx) return;
     if (ctx->converter) {
@@ -630,6 +646,7 @@ static void FreeAudioPipeline(EngineContext* ctx) {
     ctx->inFloat.clear();
     ctx->outFloat.clear();
     ctx->silence16.clear();
+    ctx->tail.clear();
     ctx->capture.clear();
     ctx->capturing = false;
 }
@@ -643,6 +660,7 @@ static bool InitAudioPipeline(EngineContext* ctx) {
     if (ctx->outRate > 192000) ctx->outRate = 192000;
     if (ctx->gainPercent < 0) ctx->gainPercent = 0;
     if (ctx->gainPercent > 100) ctx->gainPercent = 100;
+    ctx->tailLen = static_cast<size_t>(ctx->outRate) * kFadeOutMs / 1000;
 
     if (ctx->inRate == ctx->outRate) {
         return true;
@@ -665,7 +683,7 @@ static int16_t ApplyGain(int16_t sample, int gainPercent) {
 
 // Ядро отдаёт 8-битный звук, и 8-битным он обычно и уходит: 16 бит здесь лишь
 // формат переноса, поэтому понижение разрядности ничего не огрубляет.
-static int WritePcmSamples(EngineContext* ctx, const int16_t* samples, size_t count) {
+static int EmitPcmSamples(EngineContext* ctx, const int16_t* samples, size_t count) {
     if (!ctx || !samples || count == 0) return 0;
     if (ctx->outBits != 8) return WriteAllToSite(ctx, samples, count * sizeof(int16_t));
 
@@ -678,6 +696,47 @@ static int WritePcmSamples(EngineContext* ctx, const int16_t* samples, size_t co
         ctx->wave8[i] = static_cast<uint8_t>(ClampInt(rounded, -128, 127) + 128);
     }
     return WriteAllToSite(ctx, ctx->wave8.data(), count);
+}
+
+// Отдаёт звук, но последние tailLen сэмплов придерживает: пока ядро не
+// закончило, неизвестно, хвост это или середина фразы. Отдаст или погасит их
+// следующий кусок либо FinishSound.
+static int WritePcmSamples(EngineContext* ctx, const int16_t* samples, size_t count) {
+    if (!ctx || !samples || count == 0) return 0;
+    if (ctx->tailLen == 0) return EmitPcmSamples(ctx, samples, count);
+
+    std::vector<int16_t>& tail = ctx->tail;
+    if (count >= ctx->tailLen) {
+        if (EmitPcmSamples(ctx, tail.data(), tail.size()) != 0) return 1;
+        const size_t ready = count - ctx->tailLen;
+        if (EmitPcmSamples(ctx, samples, ready) != 0) return 1;
+        tail.assign(samples + ready, samples + count);
+        return 0;
+    }
+
+    tail.insert(tail.end(), samples, samples + count);
+    if (tail.size() <= ctx->tailLen) return 0;
+    const size_t ready = tail.size() - ctx->tailLen;
+    if (EmitPcmSamples(ctx, tail.data(), ready) != 0) return 1;
+    tail.erase(tail.begin(), tail.begin() + static_cast<std::ptrdiff_t>(ready));
+    return 0;
+}
+
+// Звук кончился (конец transfer ядра или паузы): придержанный хвост гасится
+// половиной косинуса до нуля и отдаётся. Через закладки придержанного сегмента
+// хвост тоже проходит до измерения его длины, поэтому смещения событий верны.
+static int FinishSound(EngineContext* ctx) {
+    if (!ctx) return 1;
+    std::vector<int16_t>& tail = ctx->tail;
+    const size_t n = tail.size();
+    constexpr double kPi = 3.14159265358979323846;
+    for (size_t i = 0; i < n; ++i) {
+        const double gain = 0.5 * (1.0 + std::cos(kPi * static_cast<double>(i + 1) / static_cast<double>(n)));
+        tail[i] = static_cast<int16_t>(std::lround(tail[i] * gain));
+    }
+    const int result = EmitPcmSamples(ctx, tail.data(), n);
+    tail.clear();
+    return result;
 }
 
 static int ProcessAndWriteSamples(EngineContext* ctx, const int16_t* inSamples, size_t inCount) {
@@ -780,7 +839,8 @@ static int WriteSilenceMs(EngineContext* ctx, int milliseconds) {
         if (WritePcmSamples(ctx, ctx->silence16.data(), n) != 0) return 1;
         totalSamples -= n;
     }
-    return 0;
+    // Нули гасить незачем, но придерживать их дольше паузы тоже нельзя.
+    return FinishSound(ctx);
 }
 
 static int __cdecl SapiConsumer16(void* buffer, size_t size, void* user_data) {
@@ -850,10 +910,37 @@ struct SpeechMark {
     size_t textIndex = 0;
 };
 
+// Состояние голоса из XML фрагмента (SPVSTATE). JAWS задаёт им скорость,
+// громкость и высоту КАЖДОЙ фразы (<rate AbsSpeed>, <volume level>,
+// <pitch AbsMiddle>), а высоту ещё и отдельным словам -- заглавным. SAPI
+// требует складывать скорость фрагмента со скоростью клиента (GetRate) и
+// перемножать громкости; без этого скорость в JAWS не менялась вовсе.
+struct VoiceState {
+    long rateAdj = 0;
+    int volume = 100;
+    long pitchMiddle = 0;
+    long pitchRange = 0;
+
+    bool operator==(const VoiceState& o) const {
+        return rateAdj == o.rateAdj && volume == o.volume &&
+            pitchMiddle == o.pitchMiddle && pitchRange == o.pitchRange;
+    }
+};
+
+static VoiceState VoiceStateOf(const SPVSTATE& state) {
+    VoiceState v;
+    v.rateAdj = state.RateAdj;
+    v.volume = static_cast<int>((state.Volume > 100) ? 100 : state.Volume);
+    v.pitchMiddle = state.PitchAdj.MiddleAdj;
+    v.pitchRange = state.PitchAdj.RangeAdj;
+    return v;
+}
+
 struct SpeechSegment {
     SpeechSegmentKind kind = SpeechSegmentKind::Text;
     std::wstring text;
     bool singleMode = false;
+    VoiceState voice;
     std::uint64_t sourceEnd = 0;
     int silenceMs = 0;
     std::vector<SpeechMark> marks;
@@ -883,17 +970,26 @@ static bool ClingsToWordAfter(wchar_t ch) {
 }
 
 // Текстовый фрагмент присоединяется к предыдущему текстовому сегменту того же
-// режима, а не заводит новый: иначе каждое слово ушло бы в ядро отдельным
-// transfer и интонация рассыпалась бы. Если между фрагментами в исходном тексте
+// режима и состояния голоса, а не заводит новый: иначе каждое слово ушло бы в
+// ядро отдельным transfer и интонация рассыпалась бы. Сменилось состояние --
+// новый сегмент: скорость и высоту ядру задают на весь transfer. Если между фрагментами в исходном тексте
 // был разрыв смещений -- значит там была граница слова, и её надо вернуть.
 static void AppendTextSegment(
     std::vector<SpeechSegment>& segments,
     const std::wstring& text,
     bool singleMode,
+    const VoiceState& voice,
     ULONG sourceOffset) {
     if (text.empty()) return;
+    // Сегмент из одних закладок (текста ещё нет) состояния не имеет -- берёт
+    // состояние первого текста.
     if (!segments.empty() && segments.back().kind == SpeechSegmentKind::Text &&
-        segments.back().singleMode == singleMode) {
+        segments.back().text.empty()) {
+        segments.back().singleMode = singleMode;
+        segments.back().voice = voice;
+    }
+    if (!segments.empty() && segments.back().kind == SpeechSegmentKind::Text &&
+        segments.back().singleMode == singleMode && segments.back().voice == voice) {
         SpeechSegment& segment = segments.back();
         const std::uint64_t offset = sourceOffset;
         const bool sourceCharactersOmitted = offset > segment.sourceEnd;
@@ -914,6 +1010,7 @@ static void AppendTextSegment(
     segment.kind = SpeechSegmentKind::Text;
     segment.text = text;
     segment.singleMode = singleMode;
+    segment.voice = voice;
     segment.sourceEnd = static_cast<std::uint64_t>(sourceOffset) + text.size();
     segments.push_back(std::move(segment));
 }
@@ -989,7 +1086,7 @@ static std::uint64_t MarkAudioOffset(std::uint64_t segmentStart,
 
 // Полная подготовка текста одного сегмента к синтезу (без koi8 -- он в Speak).
 // В посимвольном режиме имена букв из [SingleCharacters] подставляются ДО
-// чистки: иначе StripAngleTags внутри SanitizeText съел бы одиночные '<' и '>'.
+// чистки: иначе SanitizeText превратил бы одиночные '<' и '>' в пробелы.
 static std::wstring PrepareSegmentWide(
     std::wstring wtext,
     bool singleMode,
@@ -1025,6 +1122,53 @@ static std::wstring PrepareSegmentWide(
     }
     wtext = SanitizeText(std::move(wtext));
     return wtext;
+}
+
+// Журнал того, что присылает клиент: флаги, SetRate/SetVolume и состояние
+// каждого фрагмента. По нему видно, как хост задаёт скорость -- через SetRate,
+// через <rate> или обоими (JAWS шлёт <rate AbsSpeed> с каждой фразой).
+// Включается созданием пустого sapi_trace.log рядом с prefs.ini: конфигуратор
+// этот файл не трогает. Пишется только в существующий файл и не больше 4 МБ.
+static void TraceSpeak(DWORD flags, const WAVEFORMATEX* format, long siteRate, USHORT siteVolume,
+                       const SPVTEXTFRAG* frags) {
+    const std::wstring path = ParamReader::TracePath();
+    HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart > 4 * 1024 * 1024) {
+        CloseHandle(file);
+        return;
+    }
+
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t head[256];
+    swprintf(head, 256, L"%02u:%02u:%02u.%03u pid %lu flags 0x%lX %luHz/%ubit GetRate %ld GetVolume %u\r\n",
+             now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, GetCurrentProcessId(),
+             static_cast<unsigned long>(flags), format ? format->nSamplesPerSec : 0ul,
+             format ? format->wBitsPerSample : 0u, siteRate, siteVolume);
+    std::wstring line = head;
+    for (const SPVTEXTFRAG* f = frags; f; f = f->pNext) {
+        wchar_t state[160];
+        swprintf(state, 160, L"  action %d rate %ld volume %lu pitch %ld/%ld silence %lu: ",
+                 static_cast<int>(f->State.eAction), f->State.RateAdj, f->State.Volume,
+                 f->State.PitchAdj.MiddleAdj, f->State.PitchAdj.RangeAdj, f->State.SilenceMSecs);
+        line += state;
+        if (f->pTextStart) line.append(f->pTextStart, (std::min)(f->ulTextLen, 200ul));
+        line += L"\r\n";
+    }
+
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), static_cast<int>(line.size()),
+                                          nullptr, 0, nullptr, nullptr);
+    if (bytes > 0) {
+        std::string utf8(static_cast<size_t>(bytes), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, line.c_str(), static_cast<int>(line.size()),
+                            utf8.data(), bytes, nullptr, nullptr);
+        DWORD written = 0;
+        WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+    }
+    CloseHandle(file);
 }
 
 NewfonEngine::NewfonEngine() { g_objectCount.fetch_add(1, std::memory_order_relaxed); }
@@ -1104,52 +1248,17 @@ static int ToSrcConverterType(InterpolationAlgorithm alg) {
     return (alg == InterpolationAlgorithm::ZeroOrderHold) ? SRC_ZERO_ORDER_HOLD : SRC_LINEAR;
 }
 
-static long NormalizeRateAdj(long rawAdj) {
-    long v = rawAdj;
-    if (v > 100) v = 100;
-    if (v < -100) v = -100;
-    // Some hosts pass adjustment in [-100..100], while others use [-10..10].
-    if (v > 10 || v < -10) {
-        v = static_cast<long>(std::lround(static_cast<double>(v) / 10.0));
-    }
-    if (v > 10) v = 10;
-    if (v < -10) v = -10;
-    return v;
-}
-
-static int MapNormalizedAdjToRange(long normalizedAdj, int baseValue, int minValue, int maxValue) {
-    const long adj = ClampInt(static_cast<int>(normalizedAdj), -10, 10);
-    const int base = ClampInt(baseValue, minValue, maxValue);
-    if (adj == 0) return base;
-    if (adj > 0) {
-        const double t = static_cast<double>(adj) / 10.0;
-        const int span = maxValue - base;
-        return ClampInt(base + static_cast<int>(std::lround(span * t)), minValue, maxValue);
-    }
-    const double t = static_cast<double>(-adj) / 10.0;
-    const int span = base - minValue;
-    return ClampInt(base - static_cast<int>(std::lround(span * t)), minValue, maxValue);
+// Скорость клиента плюс скорость фрагмента, обрезанные до шкалы SAPI. Так же
+// поступают и голоса Microsoft: <rate AbsSpeed> у них тоже прибавляется.
+static long CombineRateAdj(long baseAdj, long fragmentAdj) {
+    const long sum = baseAdj + fragmentAdj;
+    return (sum < -10) ? -10 : (sum > 10) ? 10 : sum;
 }
 
 constexpr int kVoicePitchMin = 0;
 constexpr int kVoicePitchMax = 100;
 constexpr int kPitchAdjInputMin = -24;
 constexpr int kPitchAdjInputMax = 24;
-
-static long AbsLong(long v) {
-    return (v < 0) ? -v : v;
-}
-
-static long ReadPitchAdj(const SPVSTATE& state) {
-    const long middleAdj = static_cast<long>(state.PitchAdj.MiddleAdj);
-    const long rangeAdj = static_cast<long>(state.PitchAdj.RangeAdj);
-    if (middleAdj == 0) return rangeAdj;
-    if (rangeAdj == 0) return middleAdj;
-    if (AbsLong(rangeAdj) > AbsLong(middleAdj)) {
-        return rangeAdj;
-    }
-    return middleAdj;
-}
 
 static int MapPitchAdjToVoicePitch(long rawPitchAdj) {
     const long raw = static_cast<long>(ClampInt(static_cast<int>(rawPitchAdj), kPitchAdjInputMin, kPitchAdjInputMax));
@@ -1162,8 +1271,11 @@ static int MapPitchAdjToVoicePitch(long rawPitchAdj) {
         kVoicePitchMax);
 }
 
-static void ApplyPitchRawToConf(long rawPitchAdj, newfon_conf_t& conf) {
-    conf.pitch = ClampInt(conf.pitch + MapPitchAdjToVoicePitch(rawPitchAdj) - 50, 0, 100);
+// Сдвиг от <pitch>: MiddleAdj -- высота голоса, RangeAdj -- размах интонации.
+// Раньше оба шли в высоту (бралось большее по модулю), и <pitch range> у голоса
+// менял высоту вместо интонации.
+static int PitchOffset(long rawPitchAdj) {
+    return MapPitchAdjToVoicePitch(rawPitchAdj) - 50;
 }
 
 // Скорость ядра -- это множитель длительности: 0 самая быстрая речь, 150 самая
@@ -1180,7 +1292,7 @@ static void ApplyRateAdjToConf(long adj, newfon_conf_t& conf) {
         NEWFON_RATE_MAX);
 }
 
-HRESULT NewfonEngine::Speak(DWORD /*dwSpeakFlags*/, REFGUID formatId, const WAVEFORMATEX* format,
+HRESULT NewfonEngine::Speak(DWORD dwSpeakFlags, REFGUID formatId, const WAVEFORMATEX* format,
                            const SPVTEXTFRAG* frags, ISpTTSEngineSite* site)
 {
     if(!site) return E_POINTER;
@@ -1212,7 +1324,6 @@ HRESULT NewfonEngine::Speak(DWORD /*dwSpeakFlags*/, REFGUID formatId, const WAVE
         return E_INVALIDARG;
     ctx.outRate = static_cast<int>(format->nSamplesPerSec);
     ctx.outBits = format->wBitsPerSample;
-    ctx.gainPercent = 100;
     ctx.interpolationAlgorithm = ToSrcConverterType(params.interpolation_algorithm);
     ctx.inputFormat = CallbackInputFormat::Raw8BitBytes;
 
@@ -1242,20 +1353,6 @@ HRESULT NewfonEngine::Speak(DWORD /*dwSpeakFlags*/, REFGUID formatId, const WAVE
 
     // --- Разбор фрагментов в упорядоченные сегменты --------------------------
     std::vector<SpeechSegment> segments;
-    long pitchAdjFromSpeechFrag = 0;
-    bool hasPitchAdjFromSpeechFrag = false;
-    auto consumePitchAdj = [&](const SPVSTATE& state) {
-        const long fragPitchAdj = ReadPitchAdj(state);
-        if (!hasPitchAdjFromSpeechFrag) {
-            pitchAdjFromSpeechFrag = fragPitchAdj;
-            hasPitchAdjFromSpeechFrag = true;
-            return;
-        }
-        // Одно значение высоты на всю фразу -- держим самое сильное ненулевое.
-        if (AbsLong(fragPitchAdj) > AbsLong(pitchAdjFromSpeechFrag)) {
-            pitchAdjFromSpeechFrag = fragPitchAdj;
-        }
-    };
 
     for (auto* f = frags; f; f = f->pNext) {
         // Пустая длина больше НЕ значит "пропустить фрагмент": у закладки и у
@@ -1270,14 +1367,12 @@ HRESULT NewfonEngine::Speak(DWORD /*dwSpeakFlags*/, REFGUID formatId, const WAVE
         case SPVA_Speak:
         case SPVA_Pronounce:
             if (part.empty()) break;
-            consumePitchAdj(f->State);
-            AppendTextSegment(segments, part, false, f->ulTextSrcOffset);
+            AppendTextSegment(segments, part, false, VoiceStateOf(f->State), f->ulTextSrcOffset);
             break;
 
         case SPVA_SpellOut:
             if (part.empty()) break;
-            consumePitchAdj(f->State);
-            AppendTextSegment(segments, part, true, f->ulTextSrcOffset);
+            AppendTextSegment(segments, part, true, VoiceStateOf(f->State), f->ulTextSrcOffset);
             break;
 
         case SPVA_Bookmark:
@@ -1301,38 +1396,21 @@ HRESULT NewfonEngine::Speak(DWORD /*dwSpeakFlags*/, REFGUID formatId, const WAVE
     if (segments.empty()) return done(S_OK);
     ApplySingleCharacterMode(segments);
 
-    // --- Единый conf на всю фразу --------------------------------------------
+    // --- conf фразы; скорость, высота и громкость -- у каждого сегмента свои ---
     newfon_conf_t conf{};
     m_api.config_init(&conf);
     ParamReader::ApplyToConf(params, conf);
     conf.voice = m_voice;
+    const int basePitch = conf.pitch;
+    const int baseInflection = conf.inflection;
 
+    // Базовые значения клиента (SetVolume/SetRate). Не прочлись -- остаются
+    // нейтральными: состояние фрагментов всё равно применится.
     USHORT vol = 100;
-    if (FAILED(site->GetVolume(&vol))) {
-        ULONG v = frags ? frags->State.Volume : 100;
-        if (v > 100) v = 100;
-        vol = (USHORT)v;
-    }
-
+    if (SUCCEEDED(site->GetVolume(&vol))) ctx.baseVolume = ClampInt(static_cast<int>(vol), 0, 100);
     long rateAdj = 0;
-    if (FAILED(site->GetRate(&rateAdj))) {
-        rateAdj = frags ? frags->State.RateAdj : 0;
-    }
-    rateAdj = NormalizeRateAdj(rateAdj);
-
-    const long rawPitchAdj = hasPitchAdjFromSpeechFrag
-        ? pitchAdjFromSpeechFrag
-        : (frags ? ReadPitchAdj(frags->State) : 0);
-    ApplyPitchRawToConf(rawPitchAdj, conf);
-
-    ctx.gainPercent = ClampInt(static_cast<int>(vol), 0, 100);
-
-    // Скорость считается от запроса хоста, а не от текущего значения: SPVES_RATE
-    // посреди фразы задаёт её заново, и складываться перестройки не должны.
-    auto applyRate = [&](long normalizedAdj) {
-        ApplyRateAdjToConf(normalizedAdj, conf);
-    };
-    applyRate(rateAdj);
+    if (SUCCEEDED(site->GetRate(&rateAdj))) ctx.baseRateAdj = rateAdj;
+    TraceSpeak(dwSpeakFlags, format, rateAdj, vol, frags);
 
     const bool rulexReady = params.use_rulex && HasRulex();
     const size_t waveBufferSize =
@@ -1345,13 +1423,6 @@ HRESULT NewfonEngine::Speak(DWORD /*dwSpeakFlags*/, REFGUID formatId, const WAVE
     // --- Проход по сегментам -------------------------------------------------
     for (const SpeechSegment& segment : segments) {
         if (!CheckSapiActions(&ctx)) return done(S_OK);
-
-        // Скорость, запрошенную посреди фразы, применяем на границе сегмента:
-        // внутри transfer conf трогать нельзя.
-        if (ctx.rateDirty) {
-            ctx.rateDirty = false;
-            applyRate(NormalizeRateAdj(ctx.pendingRateAdj));
-        }
 
         if (segment.kind == SpeechSegmentKind::Silence) {
             if (WriteSilenceMs(&ctx, segment.silenceMs) != 0) return done(S_OK);
@@ -1378,6 +1449,14 @@ HRESULT NewfonEngine::Speak(DWORD /*dwSpeakFlags*/, REFGUID formatId, const WAVE
             flushRemainingMarks();
             continue;
         }
+
+        // Состояние голоса сегмента. Скорость берётся заново от текущей
+        // скорости клиента: SPVES_RATE посреди фразы задаёт её, а не прибавляет.
+        ApplyRateAdjToConf(CombineRateAdj(ctx.baseRateAdj, segment.voice.rateAdj), conf);
+        conf.pitch = ClampInt(basePitch + PitchOffset(segment.voice.pitchMiddle), 0, 100);
+        conf.inflection = ClampInt(baseInflection + PitchOffset(segment.voice.pitchRange), 0, 100);
+        ctx.segmentVolume = segment.voice.volume;
+        UpdateGain(&ctx);
 
         NormalizeForKoi8rInplace(prepared);
         std::string koi8 = WideToKoi8r(prepared);
@@ -1406,10 +1485,11 @@ HRESULT NewfonEngine::Speak(DWORD /*dwSpeakFlags*/, REFGUID formatId, const WAVE
             &ctx);
         if (ctx.sapiStop) return done(S_OK);
 
-        // Досдать хвост ресемплера, чтобы звук сегмента был полон ДО измерения
-        // его длины и расстановки событий. src_reset внутри готовит конвертер к
-        // следующему сегменту.
+        // Досдать хвост ресемплера и погасить конец звука, чтобы звук сегмента
+        // был полон ДО измерения его длины и расстановки событий. src_reset
+        // внутри готовит конвертер к следующему сегменту.
         if (FlushResampler(&ctx) != 0) return done(S_OK);
+        if (FinishSound(&ctx) != 0) return done(S_OK);
         if (ctx.sapiStop) return done(S_OK);
 
         if (holdForMarks) {

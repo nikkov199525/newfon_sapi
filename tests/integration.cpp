@@ -13,6 +13,8 @@
 #include <set>
 #include <stdexcept>
 #include <cstdint>
+#include <cstdlib>
+#include <algorithm>
 #define CHECK(x) do { if(!(x)) throw std::runtime_error(#x); } while(0)
 struct Site final : ISpTTSEngineSite {
     // Audio is kept as raw bytes: the tests ask for both 8- and 16-bit formats.
@@ -122,6 +124,47 @@ int main(int argc,char** argv) {
             std::cout<<"Latin combinations replaced as a group\n";
         }
         {
+            // XML state of the fragments (JAWS sends <rate AbsSpeed>, <volume level>,
+            // <pitch AbsMiddle> with every phrase) combines with SetRate/SetVolume
+            // as SAPI requires: rates add up, volumes multiply.
+            Write(config/"prefs.ini","[General]\nuse_dictionary=0\n");
+            ISpTTSEngine* engine=nullptr;CHECK(SUCCEEDED(factory->CreateInstance(nullptr,__uuidof(ISpTTSEngine),reinterpret_cast<void**>(&engine))));
+            ISpObjectWithToken* withToken=nullptr;CHECK(SUCCEEDED(engine->QueryInterface(__uuidof(ISpObjectWithToken),reinterpret_cast<void**>(&withToken))));
+            ISpObjectToken* token=nullptr;CHECK(SUCCEEDED(CoCreateInstance(__uuidof(SpObjectToken),nullptr,CLSCTX_INPROC_SERVER,__uuidof(ISpObjectToken),reinterpret_cast<void**>(&token))));
+            CHECK(SUCCEEDED(token->SetId(nullptr,(L"HKEY_CURRENT_USER\\"+registry).c_str(),TRUE)));
+            CHECK(SUCCEEDED(token->SetDWORD(L"VoiceIndex",0)));CHECK(SUCCEEDED(withToken->SetObjectToken(token)));
+            GUID fmt;WAVEFORMATEX* wave=nullptr;CHECK(SUCCEEDED(engine->GetOutputFormat(nullptr,nullptr,&fmt,&wave)));
+            auto speak=[&](const std::wstring& text,long fragRate,ULONG fragVolume,long siteRate,USHORT siteVolume) {
+                SPVTEXTFRAG frag{};frag.State.eAction=SPVA_Speak;frag.State.RateAdj=fragRate;frag.State.Volume=fragVolume;
+                frag.pTextStart=text.c_str();frag.ulTextLen=(ULONG)text.size();
+                Site site;site.rate=siteRate;site.volume=siteVolume;
+                CHECK(SUCCEEDED(engine->Speak(0,fmt,wave,&frag,&site)));return site.audio;
+            };
+            const std::wstring text=L"Проверка скорости речи, раз два три.";
+            auto plain=speak(text,0,100,0,100);
+            CHECK(speak(text,5,100,0,100)==speak(text,0,100,5,100));
+            CHECK(speak(text,5,100,0,100).size()<plain.size() && speak(text,-5,100,0,100).size()>plain.size());
+            CHECK(speak(text,-5,100,5,100)==plain);
+            CHECK(speak(text,0,30,0,100)==speak(text,0,100,0,30) && speak(text,0,30,0,100)!=plain);
+            // '<' and '>' are real characters here (SAPI has parsed the markup):
+            // they used to swallow the rest of the phrase as a "tag".
+            CHECK(speak(L"если a < b то дальше идёт текст",0,100,0,100)==speak(L"если a b то дальше идёт текст",0,100,0,100));
+            CHECK(speak(L"a > b <c",0,100,0,100)==speak(L"a b c",0,100,0,100));
+            // A raised word (JAWS: a capital) gets its own pitch, the rest keeps its.
+            std::wstring first=L"Открыть ",second=L"Файл";
+            SPVTEXTFRAG a{},b{};
+            a.State.eAction=SPVA_Speak;a.State.Volume=100;a.pTextStart=first.c_str();a.ulTextLen=(ULONG)first.size();a.pNext=&b;
+            b.State=a.State;b.State.PitchAdj.MiddleAdj=10;b.pTextStart=second.c_str();b.ulTextLen=(ULONG)second.size();b.ulTextSrcOffset=(ULONG)first.size();
+            Site raised;CHECK(SUCCEEDED(engine->Speak(0,fmt,wave,&a,&raised)));
+            auto opener=speak(first,0,100,0,100);
+            CHECK(raised.audio.size()>opener.size() && std::equal(opener.begin(),opener.end()-200,raised.audio.begin()));
+            b.State.PitchAdj.MiddleAdj=0;
+            Site flat;CHECK(SUCCEEDED(engine->Speak(0,fmt,wave,&a,&flat)));
+            CHECK(flat.audio==speak(first+second,0,100,0,100) && flat.audio!=raised.audio);
+            std::cout<<"XML rate, volume and pitch of fragments applied\n";
+            CoTaskMemFree(wave);token->Release();withToken->Release();engine->Release();
+        }
+        {
             // Without interpolation SAPI gets the core audio untouched: the same
             // rate, so nothing is resampled, and 8 bits hold it exactly. Resampling
             // or requantizing here would add noise about 38 dB below the signal.
@@ -140,11 +183,16 @@ int main(int argc,char** argv) {
             };
             auto eight=speakAs(8),sixteen=speakAs(16);
             CHECK(!eight.empty() && sixteen.size()==eight.size()*2);
+            // The last 5 ms fade out instead of breaking off mid-wave.
+            const size_t fade=11025*5/1000;
+            CHECK(eight.size()>fade);
             for(size_t i=0;i<eight.size();++i) {
                 const int16_t sample=(int16_t)(sixteen[2*i]|(sixteen[2*i+1]<<8));
-                CHECK((int)eight[i]-128==(sample>>8) && (sample&0xFF)==0);
+                if(i<eight.size()-fade) CHECK((int)eight[i]-128==(sample>>8) && (sample&0xFF)==0);
+                else CHECK(std::abs((int)eight[i]-128-(sample+128)/256)<=1);
             }
-            std::cout<<"Core audio reaches SAPI unchanged: "<<eight.size()<<" bytes\n";
+            CHECK(sixteen[sixteen.size()-2]==0 && sixteen.back()==0 && eight.back()==128);
+            std::cout<<"Core audio reaches SAPI unchanged, ending in a fade: "<<eight.size()<<" bytes\n";
             token->Release();withToken->Release();engine->Release();
         }
         {
