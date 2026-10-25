@@ -22,10 +22,22 @@ function(run_step)
   endif()
 endfunction()
 
+cmake_host_system_information(RESULT jobs QUERY NUMBER_OF_LOGICAL_CORES)
+
 foreach(arch x86 x64)
   set(build_dir "${SOURCE_DIR}/build/${arch}")
   set(first_configure)
-  if(NOT EXISTS "${build_dir}/CMakeCache.txt")
+  # winget puts every LLVM-MinGW update in a new versioned folder and deletes
+  # the old one, so a cache made before the update points at missing tools.
+  if(EXISTS "${build_dir}/CMakeCache.txt")
+    file(STRINGS "${build_dir}/CMakeCache.txt" cached_make REGEX "^CMAKE_MAKE_PROGRAM:")
+    string(REGEX REPLACE "^[^=]*=" "" cached_make "${cached_make}")
+    if(NOT EXISTS "${cached_make}")
+      message(STATUS "${arch}: ${cached_make} is gone, configuring from scratch")
+      list(APPEND first_configure --fresh)
+    endif()
+  endif()
+  if(NOT EXISTS "${build_dir}/CMakeCache.txt" OR first_configure)
     list(APPEND first_configure -G "MinGW Makefiles"
       "-DCMAKE_TOOLCHAIN_FILE=${SOURCE_DIR}/cmake/mingw-${arch}.cmake")
   endif()
@@ -34,7 +46,9 @@ foreach(arch x86 x64)
   run_step("${CMAKE_COMMAND}" -S "${SOURCE_DIR}" -B "${build_dir}" ${first_configure}
     -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DNEWFON_BUILD_CONFIGURATOR=ON
     -DNEWFON_REQUIRE_RELEASE_TOOLS=ON)
-  run_step("${CMAKE_COMMAND}" --build "${build_dir}" --parallel)
+  # -j goes straight to make: with --parallel CMake 4.5 also adds -Otarget,
+  # and mingw32-make 4.4.1 loses its --sync-mutex in the recursive makes.
+  run_step("${CMAKE_COMMAND}" --build "${build_dir}" -- -j${jobs})
   # Keep the existing order: both engines, then the x64 configurer test.
   run_step("${CTEST_EXECUTABLE}" --test-dir "${build_dir}" --output-on-failure -R "^integration$")
 endforeach()
