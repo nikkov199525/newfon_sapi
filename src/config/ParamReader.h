@@ -2,7 +2,6 @@
 #include <string>
 #include "newfon_core.h"
 enum class UnicodeNormalizationForm { NFC, NFKC, NFD, NFKD };
-enum class InterpolationAlgorithm { Linear, ZeroOrderHold };
 // The bridge hands SAPI 11025 Hz mono, the rate of the original Newfon SAPI (see
 // the JAWS section of docs/Russian.html); interpolation multiplies it. The core
 // rate is a separate setting -- the speed of the tape, so to say; it defaults to
@@ -19,8 +18,8 @@ struct NewfonParams {
     bool use_legacy_rate_algo=true;
     // Rate of the synthesized audio, and the rate SAPI is told about.
     int samples_per_sec=kSapiDefaultRate;
+    // 1, 2 or 4: the Nefonit-style "sample rate factor" interpolation.
     int interpolation_multiplier=1;
-    InterpolationAlgorithm interpolation_algorithm=InterpolationAlgorithm::Linear;
     static constexpr int wave_buffer_size=1024;
     int silence_at_begin=0, silence_at_end=0;
     // What SAPI is handed: the core rate times the interpolation multiplier.
@@ -28,6 +27,8 @@ struct NewfonParams {
     int pause=-1, intonation=50;
     int acceleration=NEWFON_ACCEL_OFF;
     bool dec_sep_point=true, dec_sep_comma=true;
+    // Shorter runs of leading zeros are read one zero at a time.
+    int zero_count_min=NEWFON_ZERO_COUNT_MIN_DEFAULT;
     bool use_unicode_normalization=false;
     UnicodeNormalizationForm unicode_normalization_form=UnicodeNormalizationForm::NFC;
 };

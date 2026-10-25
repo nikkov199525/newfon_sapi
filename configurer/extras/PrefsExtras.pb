@@ -2,13 +2,13 @@
 Enumeration 3000
 #NF_SampleRate
 #NF_Multiplier
-#NF_Algorithm
+#NF_ZeroCount
 #NF_Acceleration
 #NF_Legacy
 #NF_DecimalPoint
 #NF_DecimalComma
 EndEnumeration
-Global NF_SampleRate.i = 10000, NF_Multiplier.i = 1, NF_Algorithm.i, NF_Acceleration.i
+Global NF_SampleRate.i = 10000, NF_Multiplier.i = 1, NF_ZeroCount.i = 3, NF_Acceleration.i
 Global NF_Legacy.i = 1, NF_DecimalPoint.i = 1, NF_DecimalComma.i = 1
 
 Procedure.s NewfonConfigDir()
@@ -61,8 +61,9 @@ Procedure LoadExtraParameters()
   NF_Multiplier = ReadPreferenceInteger("interpolation_multiplier", 1)
   If NF_Multiplier = 3 : NF_Multiplier = 4 : EndIf
   If NF_Multiplier < 1 Or NF_Multiplier > 4 : NF_Multiplier = 1 : EndIf
-  NF_Algorithm = ReadPreferenceInteger("interpolation_algorithm", 0)
-  If NF_Algorithm < 0 Or NF_Algorithm > 1 : NF_Algorithm = 0 : EndIf
+  ; Shorter runs of leading zeros are read one zero at a time, as in Newfon for NVDA.
+  NF_ZeroCount = ReadPreferenceInteger("zero_count_min", 3)
+  If NF_ZeroCount < 2 Or NF_ZeroCount > 100 : NF_ZeroCount = 3 : EndIf
   ; Same levels as the NVDA driver: 0 is off, 7 the mildest, 1 the strongest.
   NF_Acceleration = ReadPreferenceInteger("accel", 0)
   If NF_Acceleration < 0 Or NF_Acceleration > 7 : NF_Acceleration = 0 : EndIf
@@ -74,7 +75,9 @@ EndProcedure
 Procedure SaveExtraParameters()
   WritePreferenceInteger("sample_rate", NF_SampleRate)
   WritePreferenceInteger("interpolation_multiplier", NF_Multiplier)
-  WritePreferenceInteger("interpolation_algorithm", NF_Algorithm)
+  WritePreferenceInteger("zero_count_min", NF_ZeroCount)
+  ; Left over from the linear/ZOH choice, which the Nefonit interpolation replaced.
+  RemovePreferenceKey("interpolation_algorithm")
   WritePreferenceInteger("accel", NF_Acceleration)
   WritePreferenceString("UseLegacyRateAlgo", StringField("False True", NF_Legacy+1, " "))
   WritePreferenceString("dec_sep_point", StringField("False True", NF_DecimalPoint+1, " "))
@@ -93,11 +96,11 @@ Procedure NewfonParameterGadgets()
   ComboBoxGadget(#NF_Multiplier, 560, 103, 60, 22)
   AddGadgetItem(#NF_Multiplier, -1, "1") : AddGadgetItem(#NF_Multiplier, -1, "2") : AddGadgetItem(#NF_Multiplier, -1, "4")
   SetGadgetState(#NF_Multiplier, Bool(NF_Multiplier=2)+2*Bool(NF_Multiplier=4))
-  GadgetToolTip(#NF_Multiplier, "Во сколько раз поднять частоту вывода в SAPI: 1 — 11025 Гц, 2 — 22050, 4 — 44100. Звук становится глаже, но программе приходится обрабатывать больше данных.")
-  TextGadget(#PB_Any, 630, 105, 165, 20, "Алгоритм интерполяции:")
-  ComboBoxGadget(#NF_Algorithm, 795, 103, 150, 22)
-  AddGadgetItem(#NF_Algorithm, -1, "Линейная") : AddGadgetItem(#NF_Algorithm, -1, "Нулевого порядка")
-  SetGadgetState(#NF_Algorithm, NF_Algorithm)
+  GadgetToolTip(#NF_Multiplier, "Во сколько раз поднять частоту вывода в SAPI: 1 — 11025 Гц, 2 — 22050, 4 — 44100. Интерполяция как в Nefonit TTS: между отсчётами вставляются нули, а звук сглаживается фильтром со срезом 6000 Гц.")
+  TextGadget(#PB_Any, 630, 105, 215, 20, "Произносить нули группами от:")
+  SpinGadget(#NF_ZeroCount, 845, 103, 60, 22, 2, 100, #PB_Spin_Numeric)
+  SetGadgetState(#NF_ZeroCount, NF_ZeroCount)
+  GadgetToolTip(#NF_ZeroCount, "Сколько нулей подряд читать одной группой: при 3 число 000003 звучит как «пять нулей три». Более короткие цепочки читаются по одному нулю: 00:34 — «ноль ноль: тридцать четыре».")
   TextGadget(#PB_Any, 955, 105, 80, 20, "Ускорение:")
   ComboBoxGadget(#NF_Acceleration, 1035, 103, 80, 22)
   AddGadgetItem(#NF_Acceleration, -1, "Выкл")

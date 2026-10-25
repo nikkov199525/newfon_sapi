@@ -4,7 +4,7 @@ bin=Path(sys.argv[1]).resolve()
 folder=bin.parent/'configurer-test'
 folder.mkdir(exist_ok=True)
 prefs=folder/'prefs.ini'
-prefs.write_text(re.sub(r'sample_rate = \d+','sample_rate = 13025',(bin/'prefs.ini').read_text(encoding='utf-8')).replace('interpolation_multiplier = 1','interpolation_multiplier = 4').replace('UseLegacyRateAlgo = True','UseLegacyRateAlgo = False').replace('dec_sep_point = True','dec_sep_point = False').replace('accel = 0','accel = 5').replace('[english_pronunciation]\n','[english_pronunciation]\nѯ = кс\n')+'\n[FutureSettings]\ncustom = сохранить\n',encoding='utf-8')
+prefs.write_text(re.sub(r'sample_rate = \d+','sample_rate = 13025',(bin/'prefs.ini').read_text(encoding='utf-8')).replace('interpolation_multiplier = 1','interpolation_multiplier = 4').replace('UseLegacyRateAlgo = True','UseLegacyRateAlgo = False').replace('dec_sep_point = True','dec_sep_point = False').replace('accel = 0','accel = 5').replace('zero_count_min = 3','zero_count_min = 7\ninterpolation_algorithm = 1').replace('[english_pronunciation]\n','[english_pronunciation]\nѯ = кс\n')+'\n[FutureSettings]\ncustom = сохранить\n',encoding='utf-8')
 (folder/'ru_dict.dic').write_text('молоко моло+ко\n',encoding='utf-8-sig')
 env=dict(os.environ, NEWFON_CONFIG_DIR=str(folder))
 subprocess.run([str(bin/'NewfonConfigurer.exe'),'--test-roundtrip'],env=env,check=True,timeout=15)
@@ -16,6 +16,9 @@ assert c['General']['uselegacyratealgo']=='False'
 assert c['General']['dec_sep_point']=='False'
 assert c['General']['dec_sep_comma']=='True'
 assert c['General']['accel']=='5'
+assert c['General']['zero_count_min']=='7'
+# The interpolation has no algorithm choice any more; a stale key is dropped.
+assert 'interpolation_algorithm' not in c['General']
 assert c['FutureSettings']['custom']=='сохранить'
 assert c['russian_letters']['ѣ']=='ять'
 assert c['english_pronunciation']['j']=='дж'

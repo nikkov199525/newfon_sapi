@@ -1113,10 +1113,12 @@ Repeat
 Event = WaitWindowEvent()
 If Event = #PB_Event_Gadget
 Select EventGadget()
-Case #NF_SampleRate, #NF_Multiplier, #NF_Algorithm, #NF_Acceleration, #NF_Legacy, #NF_DecimalPoint, #NF_DecimalComma
+Case #NF_SampleRate, #NF_Multiplier, #NF_ZeroCount, #NF_Acceleration, #NF_Legacy, #NF_DecimalPoint, #NF_DecimalComma
 NF_SampleRate = NF_SliderToRate(GetGadgetState(#NF_SampleRate))
 NF_Multiplier = Val(GetGadgetText(#NF_Multiplier))
-NF_Algorithm = GetGadgetState(#NF_Algorithm)
+; Typed digits reach the text before the state, so the text is what counts.
+NF_ZeroCount = Val(GetGadgetText(#NF_ZeroCount))
+If NF_ZeroCount < 2 : NF_ZeroCount = 2 : ElseIf NF_ZeroCount > 100 : NF_ZeroCount = 100 : EndIf
 NF_Acceleration = GetGadgetState(#NF_Acceleration)
 NF_Legacy = GetGadgetState(#NF_Legacy)
 ; The checkboxes forbid the separator, prefs.ini stores whether it is used.

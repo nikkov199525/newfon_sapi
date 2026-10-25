@@ -40,10 +40,10 @@ NewfonParams ParamReader::Load() {
     p.samples_per_sec=ini.Integer(L"General",L"sample_rate",kSapiDefaultRate,8000,16000);
     int mul=ini.Integer(L"General",L"interpolation_multiplier",1,1,4);
     p.interpolation_multiplier=mul==3?4:mul;
-    p.interpolation_algorithm=ini.Integer(L"General",L"interpolation_algorithm",0,0,1)==0?InterpolationAlgorithm::Linear:InterpolationAlgorithm::ZeroOrderHold;
     p.use_legacy_rate_algo=ini.Boolean(L"General",L"UseLegacyRateAlgo",true);
     p.dec_sep_point=ini.Boolean(L"General",L"dec_sep_point",true);
     p.dec_sep_comma=ini.Boolean(L"General",L"dec_sep_comma",true);
+    p.zero_count_min=ini.Integer(L"General",L"zero_count_min",NEWFON_ZERO_COUNT_MIN_DEFAULT,2,NEWFON_ZERO_COUNT_MIN_MAX);
     // As in the NVDA driver: 0 is off, 7 the mildest, 1 the strongest.
     p.acceleration=ini.Integer(L"General",L"accel",NEWFON_ACCEL_OFF,NEWFON_ACCEL_OFF,NEWFON_ACCEL_MAX);
     p.pause=prefs.Integer(L"General",L"pause",-1,-1,255);
@@ -59,7 +59,9 @@ void ParamReader::ApplyToConf(const NewfonParams& p,newfon_conf_t& conf) {
     if(p.pause>=0) conf.pause=p.pause;
     conf.inflection=p.intonation;
     conf.acceleration=p.acceleration;
-    conf.flags &= ~(DEC_SEP_POINT|DEC_SEP_COMMA|USE_LEGACY_RATE_ALGO);
+    conf.flags &= ~(DEC_SEP_POINT|DEC_SEP_COMMA|USE_LEGACY_RATE_ALGO|ZERO_COUNT_MIN_MASK);
+    // The core keeps this threshold in the flags so newfon_conf_t stays the same size.
+    conf.flags|=NEWFON_ZERO_COUNT_MIN(p.zero_count_min);
     if(p.dec_sep_point) conf.flags|=DEC_SEP_POINT;
     if(p.dec_sep_comma) conf.flags|=DEC_SEP_COMMA;
     if(p.use_legacy_rate_algo) conf.flags|=USE_LEGACY_RATE_ALGO;

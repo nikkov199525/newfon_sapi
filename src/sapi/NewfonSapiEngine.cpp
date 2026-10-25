@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cwctype>
 #include <limits>
+#include <memory>
 #include <unordered_map>
 
 extern std::atomic<long> g_objectCount;
@@ -17,6 +18,7 @@ extern std::atomic<long> g_objectCount;
 #include "IniFile.h"
 #include "TextConfig.h"
 #include "Koi8r.h"
+#include "SampleRateFactor.h"
 #include "samplerate.h"
 
 #include <windows.h>
@@ -37,18 +39,23 @@ struct EngineContext {
     // Обычно совпадает с inRate: звук ядра уходит без пересчёта. Расходятся
     // они при интерполяции и когда хост просит свой формат.
     int outRate = kSapiDefaultRate;
+    // Множитель интерполяции и частота после неё (inRate * множитель). Если она
+    // не совпала с outRate, остаток добирает линейный ресемплер.
+    int interpolationFactor = 1;
+    int midRate = kSapiDefaultRate;
     int outBits = kSapiOutputBits;
     // Итоговое усиление -- громкость клиента (SetVolume) на громкость фрагмента
     // (<volume level>): SAPI велит их перемножать.
     int gainPercent = 100;
     int baseVolume = 100;
     int segmentVolume = 100;
-    int interpolationAlgorithm = SRC_LINEAR;
     CallbackInputFormat inputFormat = CallbackInputFormat::Raw8BitBytes;
 
+    std::unique_ptr<SampleRateFactorInterpolator> interpolator;
     SRC_STATE* converter = nullptr;
     std::vector<int16_t> wave16;
     std::vector<float> inFloat;
+    std::vector<float> midFloat;
     std::vector<float> outFloat;
     std::vector<int16_t> silence16;
     std::vector<uint8_t> wave8;
@@ -629,6 +636,25 @@ static bool QueueBookmarkEvent(EngineContext* ctx, const std::wstring& name, std
     return SUCCEEDED(ctx->site->AddEvents(&event, 1));
 }
 
+// Граница слова: по ней клиенты подсвечивают читаемое слово и запоминают,
+// докуда дочитан текст. lParam -- позиция слова в исходном тексте, wParam --
+// его длина. Так было и в старом Newfon SAPI на PureBasic, только там событие
+// было одно на всю фразу.
+static bool QueueWordEvent(EngineContext* ctx, std::uint64_t sourceOffset, size_t length, std::uint64_t audioOffset) {
+    if (!ctx || !ctx->site) return false;
+    if (ctx->outBits == 16) audioOffset &= ~static_cast<std::uint64_t>(1);
+
+    SPEVENT event{};
+    event.eEventId = SPEI_WORD_BOUNDARY;
+    event.elParamType = SPET_LPARAM_IS_UNDEFINED;
+    event.ulStreamNum = 0;
+    event.ullAudioStreamOffset = audioOffset;
+    event.wParam = static_cast<WPARAM>(length);
+    event.lParam = static_cast<LPARAM>(sourceOffset);
+
+    return SUCCEEDED(ctx->site->AddEvents(&event, 1));
+}
+
 // Ядро обрывает звук посреди волны: последний сэмпл фразы бывает и -3000, и
 // -7000 (10-20% шкалы), а следом сразу тишина. Такая ступенька слышна щелчком
 // на конце каждой реплики. В JAWS реплик особенно много -- отдельная фраза на
@@ -642,8 +668,10 @@ static void FreeAudioPipeline(EngineContext* ctx) {
         src_delete(ctx->converter);
         ctx->converter = nullptr;
     }
+    ctx->interpolator.reset();
     ctx->wave16.clear();
     ctx->inFloat.clear();
+    ctx->midFloat.clear();
     ctx->outFloat.clear();
     ctx->silence16.clear();
     ctx->tail.clear();
@@ -662,12 +690,14 @@ static bool InitAudioPipeline(EngineContext* ctx) {
     if (ctx->gainPercent > 100) ctx->gainPercent = 100;
     ctx->tailLen = static_cast<size_t>(ctx->outRate) * kFadeOutMs / 1000;
 
-    if (ctx->inRate == ctx->outRate) {
+    ctx->interpolator = std::make_unique<SampleRateFactorInterpolator>(ctx->inRate, ctx->interpolationFactor);
+    ctx->midRate = ctx->interpolator->outputSampleRate();
+    if (ctx->midRate == ctx->outRate) {
         return true;
     }
 
     int error = 0;
-    ctx->converter = src_new(ctx->interpolationAlgorithm, 1, &error);
+    ctx->converter = src_new(SRC_LINEAR, 1, &error);
     return ctx->converter != nullptr && error == 0;
 }
 
@@ -742,28 +772,42 @@ static int FinishSound(EngineContext* ctx) {
 static int ProcessAndWriteSamples(EngineContext* ctx, const int16_t* inSamples, size_t inCount) {
     if (!ctx || !ctx->site || !inSamples || inCount == 0) return 0;
 
-    if (!ctx->converter || ctx->inRate == ctx->outRate) {
+    const bool interpolate = ctx->interpolator && ctx->interpolator->active();
+    // Ни интерполяции, ни пересчёта: звук ядра уходит как есть.
+    if (!interpolate && !ctx->converter) {
         return WritePcmSamples(ctx, inSamples, inCount);
     }
 
-    if (inCount > static_cast<size_t>(std::numeric_limits<int>::max())) return 1;
-    if (inCount > static_cast<size_t>(std::numeric_limits<long>::max())) return 1;
+    if (inCount > static_cast<size_t>(std::numeric_limits<int>::max()) / 4) return 1;
 
     ctx->inFloat.resize(inCount);
     src_short_to_float_array(inSamples, ctx->inFloat.data(), static_cast<int>(inCount));
 
-    const double ratio = static_cast<double>(ctx->outRate) / static_cast<double>(ctx->inRate);
+    const float* mid = ctx->inFloat.data();
+    size_t midCount = inCount;
+    if (interpolate) {
+        ctx->interpolator->Process(ctx->inFloat.data(), inCount, ctx->midFloat);
+        mid = ctx->midFloat.data();
+        midCount = ctx->midFloat.size();
+    }
+
+    if (!ctx->converter) {
+        ctx->wave16.resize(midCount);
+        src_float_to_short_array(mid, ctx->wave16.data(), static_cast<int>(midCount));
+        return WritePcmSamples(ctx, ctx->wave16.data(), midCount);
+    }
+
+    const double ratio = static_cast<double>(ctx->outRate) / static_cast<double>(ctx->midRate);
     if (!src_is_valid_ratio(ratio)) return 1;
 
-    size_t outCap = static_cast<size_t>(std::ceil(static_cast<double>(inCount) * ratio)) + 64;
-    if (outCap < 64) outCap = 64;
-    if (outCap > static_cast<size_t>(std::numeric_limits<long>::max())) return 1;
+    size_t outCap = static_cast<size_t>(std::ceil(static_cast<double>(midCount) * ratio)) + 64;
+    if (outCap > static_cast<size_t>(std::numeric_limits<int>::max())) return 1;
 
     ctx->outFloat.resize(outCap);
 
     SRC_DATA srcData{};
-    srcData.data_in = ctx->inFloat.data();
-    srcData.input_frames = static_cast<long>(inCount);
+    srcData.data_in = mid;
+    srcData.input_frames = static_cast<long>(midCount);
     srcData.data_out = ctx->outFloat.data();
     srcData.output_frames = static_cast<long>(outCap);
     srcData.src_ratio = ratio;
@@ -780,9 +824,9 @@ static int ProcessAndWriteSamples(EngineContext* ctx, const int16_t* inSamples, 
 }
 
 static int FlushResampler(EngineContext* ctx) {
-    if (!ctx || !ctx->site || !ctx->converter || ctx->inRate == ctx->outRate) return 0;
+    if (!ctx || !ctx->site || !ctx->converter) return 0;
 
-    const double ratio = static_cast<double>(ctx->outRate) / static_cast<double>(ctx->inRate);
+    const double ratio = static_cast<double>(ctx->outRate) / static_cast<double>(ctx->midRate);
     if (!src_is_valid_ratio(ratio)) return 1;
 
     ctx->outFloat.resize(512);
@@ -936,6 +980,14 @@ static VoiceState VoiceStateOf(const SPVSTATE& state) {
     return v;
 }
 
+// Откуда в исходном тексте клиента взят кусок текста сегмента. Нужно событиям
+// границ слов: SAPI ждёт в них позицию слова в ИСХОДНОМ тексте, а сегмент
+// склеен из фрагментов и местами дополнен пробелами.
+struct SourcePiece {
+    size_t textIndex = 0;
+    std::uint64_t sourceOffset = 0;
+};
+
 struct SpeechSegment {
     SpeechSegmentKind kind = SpeechSegmentKind::Text;
     std::wstring text;
@@ -944,6 +996,7 @@ struct SpeechSegment {
     std::uint64_t sourceEnd = 0;
     int silenceMs = 0;
     std::vector<SpeechMark> marks;
+    std::vector<SourcePiece> pieces;
 };
 
 // Знаки, которые пишут вплотную к слову СЛЕВА: пробел перед ними не нужен.
@@ -1002,6 +1055,7 @@ static void AppendTextSegment(
                 segment.text.push_back(L' ');
             }
         }
+        segment.pieces.push_back({ segment.text.size(), offset });
         segment.text += text;
         segment.sourceEnd = offset + text.size();
         return;
@@ -1012,6 +1066,7 @@ static void AppendTextSegment(
     segment.singleMode = singleMode;
     segment.voice = voice;
     segment.sourceEnd = static_cast<std::uint64_t>(sourceOffset) + text.size();
+    segment.pieces.push_back({ 0, sourceOffset });
     segments.push_back(std::move(segment));
 }
 
@@ -1066,8 +1121,47 @@ static void ApplySingleCharacterMode(std::vector<SpeechSegment>& segments) {
          trimmed[1] >= 0xDC00 && trimmed[1] <= 0xDFFF);
     if (!oneCharacter) return;
 
+    // Обрезанные слева пробелы сдвигают текст: куски следуют за ним.
+    const size_t lead = onlyText->text.find(trimmed);
+    for (SourcePiece& piece : onlyText->pieces) {
+        if (piece.textIndex >= lead) {
+            piece.textIndex -= lead;
+        } else {
+            piece.sourceOffset += lead - piece.textIndex;
+            piece.textIndex = 0;
+        }
+    }
     onlyText->text = trimmed;
     onlyText->singleMode = true;
+}
+
+// Слово текста сегмента: где оно в тексте сегмента и где в исходном тексте.
+struct SpeechWord {
+    size_t textIndex = 0;
+    size_t length = 0;
+    std::uint64_t sourceOffset = 0;
+};
+
+// Словами считаются куски между пробелами -- ровно то, что видит клиент.
+static std::vector<SpeechWord> SegmentWords(const SpeechSegment& segment) {
+    std::vector<SpeechWord> words;
+    const std::wstring& text = segment.text;
+    size_t piece = 0;
+    for (size_t i = 0; i < text.size();) {
+        if (std::iswspace(text[i])) { ++i; continue; }
+        const size_t start = i;
+        while (i < text.size() && !std::iswspace(text[i])) ++i;
+        while (piece + 1 < segment.pieces.size() && segment.pieces[piece + 1].textIndex <= start) ++piece;
+        SpeechWord word;
+        word.textIndex = start;
+        word.length = i - start;
+        if (!segment.pieces.empty()) {
+            const SourcePiece& from = segment.pieces[piece];
+            word.sourceOffset = from.sourceOffset + (start - from.textIndex);
+        }
+        words.push_back(word);
+    }
+    return words;
 }
 
 // Смещение закладки в байтах внутри уже синтезированного сегмента. Байты
@@ -1244,10 +1338,6 @@ HRESULT NewfonEngine::GetOutputFormat(const GUID*, const WAVEFORMATEX*, GUID* pi
 
 static int ClampInt(int v, int lo, int hi){ return (v < lo) ? lo : (v > hi) ? hi : v; }
 
-static int ToSrcConverterType(InterpolationAlgorithm alg) {
-    return (alg == InterpolationAlgorithm::ZeroOrderHold) ? SRC_ZERO_ORDER_HOLD : SRC_LINEAR;
-}
-
 // Скорость клиента плюс скорость фрагмента, обрезанные до шкалы SAPI. Так же
 // поступают и голоса Microsoft: <rate AbsSpeed> у них тоже прибавляется.
 static long CombineRateAdj(long baseAdj, long fragmentAdj) {
@@ -1324,7 +1414,7 @@ HRESULT NewfonEngine::Speak(DWORD dwSpeakFlags, REFGUID formatId, const WAVEFORM
         return E_INVALIDARG;
     ctx.outRate = static_cast<int>(format->nSamplesPerSec);
     ctx.outBits = format->wBitsPerSample;
-    ctx.interpolationAlgorithm = ToSrcConverterType(params.interpolation_algorithm);
+    ctx.interpolationFactor = params.interpolation_multiplier;
     ctx.inputFormat = CallbackInputFormat::Raw8BitBytes;
 
     if (!InitAudioPipeline(&ctx)) {
@@ -1412,6 +1502,12 @@ HRESULT NewfonEngine::Speak(DWORD dwSpeakFlags, REFGUID formatId, const WAVEFORM
     if (SUCCEEDED(site->GetRate(&rateAdj))) ctx.baseRateAdj = rateAdj;
     TraceSpeak(dwSpeakFlags, format, rateAdj, vol, frags);
 
+    // Границы слов нужны не всем клиентам, а ради них звук сегмента приходится
+    // придерживать, как ради закладок. Поэтому только по подписке.
+    ULONGLONG interest = 0;
+    const bool wantWords = SUCCEEDED(site->GetEventInterest(&interest)) &&
+        (interest & (1ULL << SPEI_WORD_BOUNDARY)) != 0;
+
     const bool rulexReady = params.use_rulex && HasRulex();
     const size_t waveBufferSize =
         static_cast<size_t>(NewfonParams::wave_buffer_size);
@@ -1467,12 +1563,13 @@ HRESULT NewfonEngine::Speak(DWORD dwSpeakFlags, REFGUID formatId, const WAVEFORM
         }
 
         const std::uint64_t segmentStart = ctx.audioBytes;
-        const bool holdForMarks = !segment.marks.empty();
+        const std::vector<SpeechWord> words = wantWords ? SegmentWords(segment) : std::vector<SpeechWord>{};
+        const bool holdForMarks = !segment.marks.empty() || !words.empty();
 
-        // Закладки заставляют придержать звук сегмента: пока он не
-        // досинтезирован, неизвестно, сколько в нём байт, а без этого событие
+        // Закладки и границы слов заставляют придержать звук сегмента: пока он
+        // не досинтезирован, неизвестно, сколько в нём байт, а без этого событие
         // некуда ставить. Задержка тут -- время СИНТЕЗА (единицы миллисекунд), а
-        // не звучания. Без закладок ничего не придерживается, и путь звука для
+        // не звучания. Без событий ничего не придерживается, и путь звука для
         // всех прочих клиентов остаётся прежним байт в байт.
         if (holdForMarks) BeginCapture(&ctx);
 
@@ -1496,11 +1593,23 @@ HRESULT NewfonEngine::Speak(DWORD dwSpeakFlags, REFGUID formatId, const WAVEFORM
             const size_t segmentBytes = ctx.capture.size();
             const size_t totalChars = segment.text.size();
             // События ставятся ДО записи своего звука -- иначе SAPI не сможет
-            // выстрелить ими вовремя.
+            // выстрелить ими вовремя -- и по порядку текста. Закладка на месте
+            // начала слова стоит после предыдущего слова, поэтому идёт первой.
+            size_t nextWord = 0;
             for (const SpeechMark& mark : segment.marks) {
+                for (; nextWord < words.size() && words[nextWord].textIndex < mark.textIndex; ++nextWord) {
+                    const SpeechWord& word = words[nextWord];
+                    (void)QueueWordEvent(&ctx, word.sourceOffset, word.length,
+                        MarkAudioOffset(segmentStart, segmentBytes, word.textIndex, totalChars));
+                }
                 const std::uint64_t offset =
                     MarkAudioOffset(segmentStart, segmentBytes, mark.textIndex, totalChars);
                 (void)QueueBookmarkEvent(&ctx, mark.name, offset);
+            }
+            for (; nextWord < words.size(); ++nextWord) {
+                const SpeechWord& word = words[nextWord];
+                (void)QueueWordEvent(&ctx, word.sourceOffset, word.length,
+                    MarkAudioOffset(segmentStart, segmentBytes, word.textIndex, totalChars));
             }
             nextMark = segment.marks.size();
             if (EndCaptureAndWrite(&ctx) != 0) return done(S_OK);

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <algorithm>
+#include <cmath>
 #define CHECK(x) do { if(!(x)) throw std::runtime_error(#x); } while(0)
 struct Site final : ISpTTSEngineSite {
     // Audio is kept as raw bytes: the tests ask for both 8- and 16-bit formats.
@@ -24,14 +25,21 @@ struct Site final : ISpTTSEngineSite {
     bool abort=false;
     size_t abortAfter=0;
     int bookmarks=0;
+    ULONGLONG interest=~0ULL;
+    // Word boundaries: source offset, length and audio offset of each word.
+    struct Word {LPARAM source;WPARAM length;ULONGLONG audio;};
+    std::vector<Word> words;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID,void** p) override {*p=this;return S_OK;}
     ULONG STDMETHODCALLTYPE AddRef() override {return 1;}
     ULONG STDMETHODCALLTYPE Release() override {return 1;}
     HRESULT STDMETHODCALLTYPE AddEvents(const SPEVENT* events,ULONG count) override {
-        for(ULONG i=0;i<count;++i) if(events[i].eEventId==SPEI_TTS_BOOKMARK) ++bookmarks;
+        for(ULONG i=0;i<count;++i) {
+            if(events[i].eEventId==SPEI_TTS_BOOKMARK) ++bookmarks;
+            if(events[i].eEventId==SPEI_WORD_BOUNDARY) words.push_back({events[i].lParam,events[i].wParam,events[i].ullAudioStreamOffset});
+        }
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE GetEventInterest(ULONGLONG* p) override {*p=~0ULL;return S_OK;}
+    HRESULT STDMETHODCALLTYPE GetEventInterest(ULONGLONG* p) override {*p=interest;return S_OK;}
     DWORD STDMETHODCALLTYPE GetActions() override {return abort || (abortAfter && audio.size()>=abortAfter)?SPVES_ABORT:0;}
     HRESULT STDMETHODCALLTYPE Write(const void* b,ULONG size,ULONG* written) override {
         CHECK(size<=1024);
@@ -66,8 +74,13 @@ int main(int argc,char** argv) {
         Write(config/"ru_dict.dic", "\xef\xbb\xbfслово сло+во\n");
         CHECK(ApplyUserDictionary(L"Слово словом") == L"сло+во словом");
         Write(config/"ru_dict.dic", "");CHECK(ApplyUserDictionary(L"слово")==L"слово");
-        Write(config/"prefs.ini", "[General]\nsample_rate=bad\ninterpolation_multiplier=99\nUseLegacyRateAlgo=garbage\naccel=8\n");
-        p=ParamReader::Load();CHECK(p.samples_per_sec==11025 && p.use_legacy_rate_algo && p.acceleration==0);
+        // The leading zero threshold travels to the core inside the flags.
+        Write(config/"prefs.ini", "[General]\nzero_count_min=5\n");
+        p=ParamReader::Load();CHECK(p.zero_count_min==5);
+        {newfon_conf_t conf{};conf.flags=ZERO_COUNT_MIN_MASK|DEC_SEP_POINT;ParamReader::ApplyToConf(p,conf);
+         CHECK((conf.flags&ZERO_COUNT_MIN_MASK)==NEWFON_ZERO_COUNT_MIN(5) && (conf.flags&DEC_SEP_POINT));}
+        Write(config/"prefs.ini", "[General]\nsample_rate=bad\ninterpolation_multiplier=99\nUseLegacyRateAlgo=garbage\naccel=8\nzero_count_min=1\n");
+        p=ParamReader::Load();CHECK(p.samples_per_sec==11025 && p.use_legacy_rate_algo && p.acceleration==0 && p.zero_count_min==3);
         // Each voice token activates a distinct core voice; no COM server registration needed.
         HMODULE dll=LoadLibraryW((bin/L"newfon_sapi.dll").c_str());CHECK(dll);
         auto getClass=reinterpret_cast<HRESULT (WINAPI*)(REFCLSID,REFIID,void**)>(GetProcAddress(dll,"DllGetClassObject"));CHECK(getClass);
@@ -122,6 +135,10 @@ int main(int argc,char** argv) {
             // A single letter still works, and the combination is not required.
             CHECK(say(base+"[english_pronunciation]\nx = кс\n",L"xy")==say(base,L"ксy"));
             std::cout<<"Latin combinations replaced as a group\n";
+            // Four zeros are a group at the default threshold of 3, one by one at 5.
+            auto grouped=say(base,L"0000 7"),single=say(base+"zero_count_min=5\n",L"0000 7");
+            CHECK(grouped!=single && grouped==say(base+"zero_count_min=4\n",L"0000 7"));
+            std::cout<<"Leading zero threshold reaches the core\n";
         }
         {
             // XML state of the fragments (JAWS sends <rate AbsSpeed>, <volume level>,
@@ -193,6 +210,23 @@ int main(int argc,char** argv) {
             }
             CHECK(sixteen[sixteen.size()-2]==0 && sixteen.back()==0 && eight.back()==128);
             std::cout<<"Core audio reaches SAPI unchanged, ending in a fade: "<<eight.size()<<" bytes\n";
+            // A word boundary per word, with its place in the source text, in
+            // order and inside the audio; a client not asking for them gets none
+            // and the same audio (the test site above asks for every event).
+            {
+                WAVEFORMATEX w{};w.wFormatTag=WAVE_FORMAT_PCM;w.nChannels=1;w.nSamplesPerSec=11025;
+                w.wBitsPerSample=16;w.nBlockAlign=2;w.nAvgBytesPerSec=22050;
+                std::wstring lead=L"  "+text;
+                SPVTEXTFRAG shifted=frag;shifted.pTextStart=lead.c_str()+2;shifted.ulTextSrcOffset=2;
+                Site site;CHECK(SUCCEEDED(engine->Speak(0,SPDFID_WaveFormatEx,&w,&shifted,&site)));
+                CHECK(site.words.size()==5 && site.audio==sixteen);
+                CHECK(site.words[0].source==2 && site.words[0].length==8 && site.words[0].audio==0);
+                CHECK(site.words[1].source==11 && site.words[1].length==7);
+                for(size_t i=1;i<site.words.size();++i) CHECK(site.words[i].audio>site.words[i-1].audio && site.words[i].audio<site.audio.size() && site.words[i].audio%2==0);
+                Site quiet;quiet.interest=0;CHECK(SUCCEEDED(engine->Speak(0,SPDFID_WaveFormatEx,&w,&frag,&quiet)));
+                CHECK(quiet.words.empty() && quiet.audio==sixteen);
+                std::cout<<"Word boundaries: "<<site.words.size()<<" words, last at byte "<<site.words.back().audio<<"\n";
+            }
             token->Release();withToken->Release();engine->Release();
         }
         {
@@ -208,6 +242,7 @@ int main(int argc,char** argv) {
             std::wstring whole=first+second;
             SPVTEXTFRAG plain{};plain.State.eAction=SPVA_Speak;plain.State.Volume=100;plain.pTextStart=whole.c_str();plain.ulTextLen=(ULONG)whole.size();
             size_t lengths[2]{},marked2x=0;
+            double rms[3]{};
             for(int marked=0;marked<3;++marked) {
                 // Third pass: interpolation doubles the output rate, bookmarks stay.
                 Write(config/"prefs.ini",marked<2?"[General]\nuse_dictionary=0\n":"[General]\nuse_dictionary=0\ninterpolation_multiplier=2\n");
@@ -221,10 +256,16 @@ int main(int argc,char** argv) {
                 Site site;CHECK(SUCCEEDED(engine->Speak(0,fmt,wave,marked?&a:&plain,&site)));
                 CHECK(site.bookmarks==(marked?1:0));
                 if(marked<2) lengths[marked]=site.audio.size(); else marked2x=site.audio.size();
+                double sum=0;const size_t n=site.audio.size()/2;
+                for(size_t i=0;i<n;++i) {const double x=(int16_t)(site.audio[2*i]|(site.audio[2*i+1]<<8));sum+=x*x;}
+                rms[marked]=std::sqrt(sum/static_cast<double>(n));
                 CoTaskMemFree(wave);token->Release();withToken->Release();engine->Release();
             }
             CHECK(lengths[0]>1000 && lengths[1]==lengths[0]);
             CHECK(marked2x>lengths[1]*19/10 && marked2x<lengths[1]*21/10);
+            // Zero stuffing halves the energy; the filter gain of the Nefonit
+            // interpolation brings the loudness back.
+            CHECK(rms[2]>rms[1]*0.8 && rms[2]<rms[1]*1.25);
             std::cout<<"Bookmarked audio survives resampling: "<<lengths[1]<<" -> "<<marked2x<<" bytes with interpolation\n";
         }
         factory->Release();FreeLibrary(dll);
